@@ -91,9 +91,9 @@ let read_string ls =
   let rec loop () =
     match peek ls with
     | None ->
-      Printf.eprintf "Error: unterminated string literal at line %d, col %d\n"
+      Printf.eprintf "Error: unexpected string literal at line %d, col %d\n"
         start_line start_col;
-      ()
+      exit 1
     | Some '"' ->
       Buffer.add_char buf '"';
       advance ls
@@ -102,7 +102,10 @@ let read_string ls =
       advance ls;
       (match peek ls with
        | Some c -> Buffer.add_char buf c; advance ls; loop ()
-       | None -> ())
+       | None ->
+         Printf.eprintf "Error: unexpected escape sequence in string at line %d, col %d\n"
+           start_line start_col;
+         exit 1)
     | Some c ->
       Buffer.add_char buf c;
       advance ls;
@@ -113,30 +116,57 @@ let read_string ls =
 
 let read_char ls =
   let start_line = ls.line and start_col = ls.col in
-  let buf = Buffer.create 8 in
-  Buffer.add_char buf '\'';
   advance ls;
-  let rec loop () =
+  (match peek ls with
+   | None ->
+     Printf.eprintf "Error: unexpected char literal at line %d, col %d\n"
+       start_line start_col;
+     exit 1
+   | Some '\'' ->
+     Printf.eprintf "Error: empty char literal at line %d, col %d\n"
+       start_line start_col;
+     exit 1
+   | _ -> ());
+  let ch =
     match peek ls with
-    | None ->
-      Printf.eprintf "Error: unterminated char literal at line %d, col %d\n"
-        start_line start_col
-    | Some '\'' ->
-      Buffer.add_char buf '\'';
-      advance ls
     | Some '\\' ->
-      Buffer.add_char buf '\\';
       advance ls;
       (match peek ls with
-       | Some c -> Buffer.add_char buf c; advance ls; loop ()
-       | None -> ())
+       | None ->
+         Printf.eprintf "Error: unexpected escape sequence in char literal at line %d, col %d\n"
+           start_line start_col;
+         exit 1
+       | Some c ->
+         let valid = match c with
+           | 'n' | 't' | 'r' | '\\' | '\'' | '"' | '0' | 'a' | 'b' | 'f' | 'v' -> true
+           | _ -> false
+         in
+         if not valid then begin
+           Printf.eprintf "Error: invalid escape sequence '\\%c' in char literal at line %d, col %d\n"
+             c start_line start_col;
+           exit 1
+         end;
+         advance ls;
+         Printf.sprintf "\\%c" c)
     | Some c ->
-      Buffer.add_char buf c;
       advance ls;
-      loop ()
+      String.make 1 c
+    | None ->
+      Printf.eprintf "Error: unexpected char literal at line %d, col %d\n"
+        start_line start_col;
+      exit 1
   in
-  loop ();
-  make_token TCharLiteral (Buffer.contents buf) start_line start_col
+  (match peek ls with
+   | Some '\'' -> advance ls
+   | Some c ->
+     Printf.eprintf "Error: char literal contains more than one character (got '%c') at line %d, col %d\n"
+       c start_line start_col;
+     exit 1
+   | None ->
+     Printf.eprintf "Error: unexpected char literal at line %d, col %d\n"
+       start_line start_col;
+     exit 1);
+  make_token TCharLiteral (Printf.sprintf "'%s'" ch) start_line start_col
 
 let read_number ls =
   let start_line = ls.line and start_col = ls.col in
@@ -154,7 +184,13 @@ let read_number ls =
      while (match peek ls with Some c when is_digit c -> true | _ -> false) do
        Buffer.add_char buf (current_char ls);
        advance ls
-     done
+     done;
+     (match peek ls, peek_at ls 1 with
+      | Some '.', Some c when is_digit c ->
+        Printf.eprintf "Error: multiple decimal points in float literal at line %d, col %d\n"
+          start_line start_col;
+        exit 1
+      | _ -> ())
    | Some '.', Some '.' -> ()
    | _ -> ());
   (match peek ls with
@@ -167,34 +203,61 @@ let read_number ls =
         Buffer.add_char buf (current_char ls);
         advance ls
       | _ -> ());
+     let exp_digits = ref 0 in
      while (match peek ls with Some c when is_digit c -> true | _ -> false) do
        Buffer.add_char buf (current_char ls);
-       advance ls
-     done
+       advance ls;
+       incr exp_digits
+     done;
+     if !exp_digits = 0 then begin
+       Printf.eprintf "Error: exponent has no digits in float literal at line %d, col %d\n"
+         start_line start_col;
+       exit 1
+     end
    | _ -> ());
+  let check_no_trailing_alpha suffix =
+    match peek ls with
+    | Some c when is_alpha c || c = '_' ->
+      Printf.eprintf "Error: invalid numeric suffix '%s%c' at line %d, col %d\n"
+        suffix c start_line start_col;
+      exit 1
+    | _ -> ()
+  in
   (match peek ls with
    | Some 'u' ->
+     if !is_float then begin
+       Printf.eprintf "Error: invalid suffix 'u' on float literal at line %d, col %d\n"
+         start_line start_col;
+       exit 1
+     end;
      Buffer.add_char buf 'u';
      advance ls;
      (match peek ls with
-      | Some ('y' | 's' | 'L') ->
-        Buffer.add_char buf (current_char ls);
-        advance ls
+      | Some ('y' | 's' | 'L' as c) ->
+        Buffer.add_char buf c;
+        advance ls;
+        check_no_trailing_alpha (Printf.sprintf "u%c" c)
+      | Some c when is_alpha c ->
+        Printf.eprintf "Error: invalid numeric suffix 'u%c' at line %d, col %d\n"
+          c start_line start_col;
+        exit 1
       | _ -> ())
-   | Some ('y' | 's' | 'I') ->
-     Buffer.add_char buf (current_char ls);
-     advance ls
-   | Some 'L' ->
-     Buffer.add_char buf (current_char ls);
-     advance ls
-   | Some 'f' ->
+   | Some ('y' | 's' | 'I' | 'L' as c) ->
+     if !is_float then begin
+       Printf.eprintf "Error: invalid suffix '%c' on float literal at line %d, col %d\n"
+         c start_line start_col;
+       exit 1
+     end;
+     Buffer.add_char buf c; advance ls;
+     check_no_trailing_alpha (String.make 1 c)
+   | Some ('f' | 'm' as c) ->
      is_float := true;
-     Buffer.add_char buf (current_char ls);
-     advance ls
-   | Some 'm' ->
-     is_float := true;
-     Buffer.add_char buf (current_char ls);
-     advance ls
+     Buffer.add_char buf c; advance ls;
+     check_no_trailing_alpha (String.make 1 c)
+   | Some c when is_alpha c || c = '_' ->
+     Printf.eprintf "Error: invalid numeric suffix '%c' at line %d, col %d\n"
+       c start_line start_col;
+     exit 1
    | _ -> ());
   let tt = if !is_float then TFloatLiteral else TIntLiteral in
   make_token tt (Buffer.contents buf) start_line start_col
@@ -236,8 +299,8 @@ let skip_block_comment ls =
   while !depth > 0 do
     match peek ls with
     | None ->
-      Printf.eprintf "Error: unterminated block comment\n";
-      depth := 0
+      Printf.eprintf "Error: unexpected block comment\n";
+      exit 1
     | Some '(' when peek_at ls 1 = Some '*' ->
       incr depth; advance ls; advance ls
     | Some '*' when peek_at ls 1 = Some ')' ->
@@ -294,8 +357,7 @@ let rec next_token ls =
     make_token TDelimiter (String.make 1 c) line col
   | Some c ->
     Printf.eprintf "Error: unexpected character '%c' at line %d, col %d\n" c line col;
-    advance ls;
-    next_token ls
+    exit 1
 
 let tokenize src =
   let ls = make_lexer src in
