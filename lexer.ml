@@ -73,15 +73,17 @@ let advance ls =
     ls.pos <- ls.pos + 1
   end
 
-let current_char ls =
-  if ls.pos < String.length ls.src then ls.src.[ls.pos]
-  else '\000'
-
 let is_alpha c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 let is_digit c = c >= '0' && c <= '9'
 let is_alnum c = is_alpha c || is_digit c
 
 let make_token tt value line col = { token_type = tt; value; line; col }
+
+let read_while ls pred buf =
+  while (match peek ls with Some c when pred c -> true | _ -> false) do
+    Buffer.add_char buf (Option.get (peek ls));
+    advance ls
+  done
 
 let read_string ls =
   let start_line = ls.line and start_col = ls.col in
@@ -151,10 +153,7 @@ let read_char ls =
     | Some c ->
       advance ls;
       String.make 1 c
-    | None ->
-      Printf.eprintf "Error: unexpected char literal at line %d, col %d\n"
-        start_line start_col;
-      exit 1
+    | None -> assert false
   in
   (match peek ls with
    | Some '\'' -> advance ls
@@ -172,19 +171,13 @@ let read_number ls =
   let start_line = ls.line and start_col = ls.col in
   let buf = Buffer.create 32 in
   let is_float = ref false in
-  while (match peek ls with Some c when is_digit c -> true | _ -> false) do
-    Buffer.add_char buf (current_char ls);
-    advance ls
-  done;
+  read_while ls is_digit buf;
   (match peek ls, peek_at ls 1 with
    | Some '.', Some c when is_digit c ->
      is_float := true;
      Buffer.add_char buf '.';
      advance ls;
-     while (match peek ls with Some c when is_digit c -> true | _ -> false) do
-       Buffer.add_char buf (current_char ls);
-       advance ls
-     done;
+     read_while ls is_digit buf;
      (match peek ls, peek_at ls 1 with
       | Some '.', Some c when is_digit c ->
         Printf.eprintf "Error: multiple decimal points in float literal at line %d, col %d\n"
@@ -196,16 +189,16 @@ let read_number ls =
   (match peek ls with
    | Some ('e' | 'E') ->
      is_float := true;
-     Buffer.add_char buf (current_char ls);
+     Buffer.add_char buf (Option.get (peek ls));
      advance ls;
      (match peek ls with
       | Some ('+' | '-') ->
-        Buffer.add_char buf (current_char ls);
+        Buffer.add_char buf (Option.get (peek ls));
         advance ls
       | _ -> ());
      let exp_digits = ref 0 in
      while (match peek ls with Some c when is_digit c -> true | _ -> false) do
-       Buffer.add_char buf (current_char ls);
+       Buffer.add_char buf (Option.get (peek ls));
        advance ls;
        incr exp_digits
      done;
@@ -265,31 +258,23 @@ let read_number ls =
 let read_identifier ls =
   let start_line = ls.line and start_col = ls.col in
   let buf = Buffer.create 32 in
-  while (match peek ls with Some c when is_alnum c || c = '_' -> true | _ -> false) do
-    Buffer.add_char buf (current_char ls);
-    advance ls
-  done;
+  read_while ls (fun c -> is_alnum c || c = '_') buf;
   let s = Buffer.contents buf in
-  if s = "true" || s = "false" then
-    make_token TBoolLiteral s start_line start_col
-  else if s = "_" then
-    make_token TWildcard s start_line start_col
-  else if is_keyword s then
-    make_token TKeyword s start_line start_col
-  else
-    make_token TIdentifier s start_line start_col
+  let tt =
+    if s = "true" || s = "false" then TBoolLiteral
+    else if s = "_" then TWildcard
+    else if is_keyword s then TKeyword
+    else TIdentifier
+  in
+  make_token tt s start_line start_col
 
 let skip_whitespace ls =
-  while (match peek ls with
-         | Some (' ' | '\t' | '\r' | '\n') -> true
-         | _ -> false) do
+  while (match peek ls with Some (' ' | '\t' | '\r' | '\n') -> true | _ -> false) do
     advance ls
   done
 
 let skip_line_comment ls =
-  while (match peek ls with
-         | Some c when c <> '\n' -> true
-         | _ -> false) do
+  while (match peek ls with Some c when c <> '\n' -> true | _ -> false) do
     advance ls
   done
 
@@ -344,15 +329,12 @@ let rec next_token ls =
   | Some '|' ->
     advance ls;
     make_token TPipe "|" line col
-  | Some ('=' | '+' | '*' | '<' | '>' | '%') ->
-    let c = current_char ls in
+  | Some ('=' | '+' | '*' | '-' | '<' | '>' | '%') ->
+    let c = Option.get (peek ls) in
     advance ls;
     make_token TOperator (String.make 1 c) line col
-  | Some '-' ->
-    advance ls;
-    make_token TOperator "-" line col
   | Some ('(' | ')' | '[' | ']' | '{' | '}' | ';' | ',' | ':' | '.') ->
-    let c = current_char ls in
+    let c = Option.get (peek ls) in
     advance ls;
     make_token TDelimiter (String.make 1 c) line col
   | Some c ->
@@ -375,52 +357,16 @@ let needs_ident_entry = function
   | TStringLiteral | TCharLiteral | TBoolLiteral | TWildcard -> true
   | _ -> false
 
-let build_keyword_table tokens =
+let build_table predicate tokens =
   let seen = Hashtbl.create 16 in
-  let result = ref [] in
   let id = ref 1 in
-  List.iter (fun tok ->
-    if tok.token_type = TKeyword && not (Hashtbl.mem seen tok.value) then begin
+  List.filter_map (fun tok ->
+    if predicate tok.token_type && not (Hashtbl.mem seen tok.value) then begin
       Hashtbl.add seen tok.value true;
-      result := (!id, tok.value) :: !result;
-      incr id
-    end
-  ) tokens;
-  List.rev !result
-
-let build_operator_table tokens =
-  let seen = Hashtbl.create 16 in
-  let result = ref [] in
-  let id = ref 1 in
-  List.iter (fun tok ->
-    let is_op = match tok.token_type with
-      | TOperator | TAssign | TArrow | TCompose | TRange -> true
-      | _ -> false
-    in
-    if is_op && not (Hashtbl.mem seen tok.value) then begin
-      Hashtbl.add seen tok.value true;
-      result := (!id, tok.value) :: !result;
-      incr id
-    end
-  ) tokens;
-  List.rev !result
-
-let build_delimiter_table tokens =
-  let seen = Hashtbl.create 16 in
-  let result = ref [] in
-  let id = ref 1 in
-  List.iter (fun tok ->
-    let is_delim = match tok.token_type with
-      | TDelimiter | TArrayOpen | TArrayClose | TPipe -> true
-      | _ -> false
-    in
-    if is_delim && not (Hashtbl.mem seen tok.value) then begin
-      Hashtbl.add seen tok.value true;
-      result := (!id, tok.value) :: !result;
-      incr id
-    end
-  ) tokens;
-  List.rev !result
+      let r = (!id, tok.value) in
+      incr id; Some r
+    end else None
+  ) tokens
 
 let print_table title table =
   Printf.printf "\n------ %s ------\n" title;
@@ -469,13 +415,15 @@ let () =
 
   print_table "CONSTANTS AND IDENTIFIERS" !ident_table;
 
-  let kw_table = build_keyword_table tokens in
+  let kw_table = build_table (fun t -> t = TKeyword) tokens in
   print_table "KEYWORDS" kw_table;
 
-  let op_table = build_operator_table tokens in
+  let op_table = build_table (fun t -> match t with
+    | TOperator | TAssign | TArrow | TCompose | TRange -> true | _ -> false) tokens in
   print_table "OPERATORS" op_table;
 
-  let delim_table = build_delimiter_table tokens in
+  let delim_table = build_table (fun t -> match t with
+    | TDelimiter | TArrayOpen | TArrayClose | TPipe -> true | _ -> false) tokens in
   print_table "DELIMITERS" delim_table;
 
   Printf.printf "\n------ LEXEME STREAM ------\n";
