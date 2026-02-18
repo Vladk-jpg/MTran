@@ -46,10 +46,10 @@ let lookup_or_add_ident value =
     id
 
 type lexer_state = {
-  src  : string;
-  mutable pos  : int;
+  src : string;
+  mutable pos : int;
   mutable line : int;
-  mutable col  : int;
+  mutable col : int;
 }
 
 let make_lexer src = { src; pos = 0; line = 1; col = 1 }
